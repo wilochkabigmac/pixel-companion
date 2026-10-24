@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""oc-attach - grab a picture to send to the companion.
+
+Takes the image on the clipboard if there is one, otherwise a screenshot of
+the screen, and prints the path of the file it saved. The companion picks it
+up from there.
+
+    oc-attach            # the clipboard image, or a screenshot
+    oc-attach --screen   # always a screenshot
+    oc-attach --clip     # only the clipboard image
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+STATE = os.path.expanduser("~/.local/state/oc-companion/attachments")
+
+
+def clipboard_image() -> str | None:
+    """Save the clipboard image, if the clipboard holds one."""
+    if not shutil.which("wl-paste"):
+        return None
+    try:
+        res = subprocess.run(["wl-paste", "--type", "image/png"],
+                             capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0 or not res.stdout:
+        return None
+    return save(res.stdout, "clipboard.png")
+
+
+def screenshot() -> str | None:
+    """Save a screenshot of the screen."""
+    if not shutil.which("grim"):
+        return None
+    try:
+        res = subprocess.run(["grim", "-"], capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0 or not res.stdout:
+        return None
+    return save(res.stdout, "screen.png")
+
+
+def save(data: bytes, name: str) -> str:
+    os.makedirs(STATE, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(STATE, f"{stamp}-{name}")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    want_screen = "--screen" in args
+    only_clip = "--clip" in args
+
+    path = None
+    if not want_screen:
+        path = clipboard_image()
+    if path is None and not only_clip:
+        path = screenshot()
+
+    if path is None:
+        print("nothing to attach", file=sys.stderr)
+        return 1
+
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

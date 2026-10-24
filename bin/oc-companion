@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# oc-companion - start, stop or toggle the opencode desktop companion.
+#
+#   oc-companion            toggle show/hide
+#   oc-companion start      start it (and show it)
+#   oc-companion stop       quit it
+#   oc-companion status     is it running?
+#   oc-companion ask "..."  send a message to the companion
+#   oc-companion mood happy preview an expression (any name works)
+#   oc-companion reload     re-read config.json and the artwork
+set -uo pipefail
+
+CONFIG="companion"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/oc-companion"
+SERVER_FILE="$STATE_DIR/server.json"
+TRAY_PID="$STATE_DIR/tray.pid"
+BRIDGE_PID="$STATE_DIR/bridge.pid"
+SERVER_PORT=4096
+
+running() {
+  quickshell ipc -c "$CONFIG" show 2>/dev/null | grep -q "^target $CONFIG"
+}
+
+# Config: "shared" (default) uses the opencode server you already run.
+# "dedicated" gives the companion its own server instance so a TUI can
+# never attach to its session.
+config_value() {
+  local key="$1" default="$2" file="$HOME/.config/oc-companion/config.json"
+  [[ -f "$file" ]] || { echo "$default"; return; }
+  python3 -c "
+import json,sys
+try:
+    print(json.load(open('$file')).get('$key', '$default'))
+except Exception:
+    print('$default')
+" 2>/dev/null || echo "$default"
+}
+
+dedicated_server_running() {
+  [[ -f "$SERVER_FILE" ]] || return 1
+  python3 - "$SERVER_FILE" <<'PY' 2>/dev/null
+import json,sys,urllib.request
+info = json.load(open(sys.argv[1]))
+urllib.request.urlopen(info["url"] + "/global/health", timeout=4)
+PY
+}
+
+start_dedicated_server() {
+  if dedicated_server_running; then
+    return 0
+  fi
+
+  mkdir -p "$STATE_DIR"
+  local log="$STATE_DIR/server.log"
+  setsid opencode serve --port "$SERVER_PORT" --hostname 127.0.0.1 >"$log" 2>&1 </dev/null &
+
+  for _ in $(seq 1 40); do
+    sleep 0.5
+    local pw
+    pw="$(grep -oE 'server password [A-Za-z0-9_-]+' "$log" 2>/dev/null | head -1 | awk '{print $3}')"
+    if [[ -n "$pw" ]]; then
+      python3 - "$SERVER_FILE" "$SERVER_PORT" "$pw" <<'PY'
+import json, sys
+path, port, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+json.dump({"url": f"http://127.0.0.1:{port}", "password": pw}, open(path, "w"), indent=2)
+PY
+      return 0
+    fi
+  done
+  echo "dedicated opencode server did not come up (see $log)" >&2
+  return 1
+}
+
+start_companion() {
+  if [[ "$(config_value server shared)" == "dedicated" ]]; then
+    start_dedicated_server
+  fi
+
+  start_tray
+  start_bridge
+
+  if running; then
+    quickshell ipc -c "$CONFIG" call "$CONFIG" summon 2>/dev/null || true
+    return 0
+  fi
+  setsid quickshell -c "$CONFIG" >/dev/null 2>&1 &
+  # give the shell a moment to register its IPC target
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    running && break
+    sleep 0.3
+  done
+}
+
+tray_running() {
+  [[ -f "$TRAY_PID" ]] && kill -0 "$(cat "$TRAY_PID" 2>/dev/null)" 2>/dev/null
+}
+
+start_tray() {
+  tray_running && return 0
+  setsid "$HOME/.local/bin/oc-tray" >/dev/null 2>&1 </dev/null &
+  echo $! > "$TRAY_PID"
+  sleep 0.5
+}
+
+stop_tray() {
+  if [[ -f "$TRAY_PID" ]]; then
+    kill "$(cat "$TRAY_PID" 2>/dev/null)" 2>/dev/null
+    rm -f "$TRAY_PID"
+  fi
+}
+
+bridge_running() {
+  [[ -f "$BRIDGE_PID" ]] && kill -0 "$(cat "$BRIDGE_PID" 2>/dev/null)" 2>/dev/null
+}
+
+start_bridge() {
+  bridge_running && return 0
+  setsid "$HOME/.local/bin/oc-voice-bridge" >/dev/null 2>&1 </dev/null &
+  echo $! > "$BRIDGE_PID"
+  sleep 0.4
+}
+
+stop_bridge() {
+  if [[ -f "$BRIDGE_PID" ]]; then
+    kill "$(cat "$BRIDGE_PID" 2>/dev/null)" 2>/dev/null
+    rm -f "$BRIDGE_PID"
+  fi
+}
+
+case "${1:-toggle}" in
+  start)
+    start_companion
+    ;;
+  stop)
+    if running; then
+      quickshell kill -c "$CONFIG" >/dev/null 2>&1
+    fi
+    stop_tray
+    stop_bridge
+    ;;
+  toggle)
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" toggle >/dev/null 2>&1
+    else
+      start_companion
+    fi
+    ;;
+  status)
+    running && echo "running" || echo "stopped"
+    ;;
+  ask)
+    shift
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" ask "$*" >/dev/null 2>&1
+    else
+      start_companion
+      sleep 1
+      quickshell ipc -c "$CONFIG" call "$CONFIG" ask "$*" >/dev/null 2>&1
+    fi
+    ;;
+  position)
+    # position <x> <y> <left|right> <monitor>
+    shift
+    mkdir -p "$STATE_DIR"
+    python3 - "$STATE_DIR/position.json" "${1:-0}" "${2:-0}" "${3:-right}" "${4:-}" <<'PY'
+import json, sys
+path, x, y, side, monitor = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+json.dump({
+    "version": 2,
+    "x": float(x),
+    "y": float(y),
+    "right": side == "right",
+    "monitor": monitor,
+}, open(path, "w"), indent=2)
+PY
+    ;;
+  show)
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" summon >/dev/null 2>&1
+    else
+      start_companion
+      sleep 1
+      quickshell ipc -c "$CONFIG" call "$CONFIG" summon >/dev/null 2>&1
+    fi
+    ;;
+  result)
+    # result <text> - show a result in the assistant bubble
+    shift
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" result "$*" >/dev/null 2>&1
+    else
+      start_companion
+      sleep 1
+      quickshell ipc -c "$CONFIG" call "$CONFIG" result "$*" >/dev/null 2>&1
+    fi
+    ;;
+  attach)
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" attach >/dev/null 2>&1
+    else
+      start_companion
+      sleep 1
+      quickshell ipc -c "$CONFIG" call "$CONFIG" attach >/dev/null 2>&1
+    fi
+    ;;
+  menu)
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" menu >/dev/null 2>&1
+    fi
+    ;;
+  hide)
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" dismiss >/dev/null 2>&1
+    fi
+    ;;
+  reload)
+    # re-read config.json without restarting the widget
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" reload >/dev/null 2>&1
+    fi
+    ;;
+  mood)
+    # mood <name> - preview an expression, e.g. oc-companion mood happy
+    shift
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" mood "${1:-happy}" >/dev/null 2>&1
+    fi
+    ;;
+  voice)
+    # voice on|off
+    shift
+    state="${1:-toggle}"
+    python3 - "$HOME/.config/oc-companion/config.json" "$state" <<'PY'
+import json, os, sys
+path, state = sys.argv[1], sys.argv[2]
+config = {}
+try:
+    with open(path) as fh:
+        config = json.load(fh)
+except (OSError, ValueError):
+    pass
+current = config.get("voice", True)
+if state == "on":
+    value = True
+elif state == "off":
+    value = False
+else:
+    value = not current
+config["voice"] = value
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as fh:
+    json.dump(config, fh, indent=2)
+print("voice", "on" if value else "off")
+PY
+    # tell the running companion about the change
+    if running; then
+      quickshell ipc -c "$CONFIG" call "$CONFIG" reload >/dev/null 2>&1
+    fi
+    ;;
+  *)
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac

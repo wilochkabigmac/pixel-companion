@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""oc-voice - speak like a game character.
+
+Not text-to-speech. This is a formant synth: each syllable is a short burst
+of a glottal pulse train pushed through two vowel formants, with a soft
+attack and a gentle release so it reads as a voice rather than a click. A
+reply comes out as "a-a-a-a".
+
+    oc-voice "hello there"          speak a line
+    oc-voice --stream               read lines from stdin, speaking each as it
+                                    arrives (this is what the widget uses, so
+                                    the blips follow the typing)
+    oc-voice --rate 14 --pitch 1.2   syllables per second, and a pitch shift
+    oc-voice --sfx happy             a short sound effect instead of speech
+
+Drop your own samples in ~/.config/oc-companion/voice/ to replace the
+synthesiser: "a.wav", "b.wav", ... are played for that letter, and any other
+name is used as a pool to pick from at random.
+
+Sound effects have their own folder: ~/.config/oc-companion/sfx/click.wav
+(or .ogg, .flac, .mp3) replaces the synthesised click, and the same works
+for happy, love, sad, surprised and thinking.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import random
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import wave
+
+RATE = 48000
+VOICE_DIR = os.path.expanduser("~/.config/oc-companion/voice")
+SFX_DIR = os.path.expanduser("~/.config/oc-companion/sfx")
+
+# Voice presets. "bright" is the default: low enough to have a body, high
+# enough not to sound like something growling in a cellar.
+VOICES = {
+    "bright": {"pitch": 305.0, "formant": 1.00, "breath": 0.00},
+    "soft":   {"pitch": 338.0, "formant": 1.10, "breath": 0.06},
+    "deep":   {"pitch": 232.0, "formant": 0.93, "breath": 0.00},
+    "chip":   {"pitch": 520.0, "formant": 1.18, "breath": 0.02},
+    "robot":  {"pitch": 276.0, "formant": 0.80, "breath": 0.00},
+}
+
+BASE_PITCH = VOICES["bright"]["pitch"]
+
+# Pentatonic steps, in semitones, so the melody never sounds like an error.
+PENTATONIC = [0, 2, 4, 7, 9, 12, 14, 16]
+
+# Vowel formants (F1, F2) and their bandwidths. These are the vowel colours
+# the ear reads as "a", "e", "o" and so on.
+VOWELS = {
+    "a": (760, 1180, 90, 110),
+    "e": (560, 1900, 80, 120),
+    "i": (300, 2400, 70, 120),
+    "o": (600, 900, 80, 100),
+    "u": (330, 920, 70, 100),
+}
+
+
+def vowel_for(char: str) -> tuple:
+    """Pick a vowel colour for a character."""
+    c = char.lower()
+    if c in "aeiou":
+        return VOWELS[c]
+    if c in "bdgklmnprtvhz":
+        return VOWELS["a"]
+    if c in "csx":
+        return VOWELS["e"]
+    if c in "fj":
+        return VOWELS["i"]
+    if c in "wquy":
+        return VOWELS["u"]
+    if c in "cg":
+        return VOWELS["o"]
+    return VOWELS["a"]
+
+
+class Resonator:
+    """Two-pole resonator, used to give a blip its vowel colour."""
+
+    def __init__(self, freq: float, bandwidth: float):
+        r = math.exp(-math.pi * bandwidth / RATE)
+        theta = 2 * math.pi * freq / RATE
+        self.a1 = 2 * r * math.cos(theta)
+        self.a2 = -r * r
+        self.gain = (1 - r) * math.sqrt(max(0.0, 1 - 2 * r * math.cos(2 * theta) + r * r))
+        self.y1 = 0.0
+        self.y2 = 0.0
+
+    def process(self, x: float) -> float:
+        y = x + self.a1 * self.y1 + self.a2 * self.y2
+        self.y2 = self.y1
+        self.y1 = y
+        return y * self.gain
+
+
+def glottal(phase: float) -> float:
+    """A soft glottal pulse: a rounded, lowpassed impulse.
+
+    A raw sawtooth is too buzzy for a voice; this is the pulse train a
+    glottis makes, rounded off so the formants have something clean to
+    resonate.
+    """
+    return (2.0 * phase - 1.0) - 0.32 * math.sin(2 * math.pi * phase)
+
+
+def blip(f0: float, duration: float, vowel: tuple, seed: int) -> list[float]:
+    """One syllable."""
+    rng = random.Random(seed)
+    f1, f2, bw1, bw2 = vowel
+    r1 = Resonator(f1, bw1)
+    r2 = Resonator(f2, bw2)
+
+    n = int(RATE * duration)
+    out: list[float] = []
+
+    attack = 0.022   # a soft onset, not a click
+    release = 0.040  # a gentle tail
+    body = max(0.001, duration - attack - release)
+
+    phase = 0.0
+    for i in range(n):
+        t = i / RATE
+        progress = i / max(1, n)
+
+        # The pitch lifts a little as the syllable starts and settles as it
+        # ends, and wobbles very slightly the way a voice does.
+        lift = 1.0 + 0.07 * (1.0 - progress)
+        wobble = 1.0 + 0.010 * math.sin(2 * math.pi * 5.5 * t)
+        freq = f0 * lift * (1.0 - 0.08 * progress) * wobble
+        phase += freq / RATE
+        if phase >= 1.0:
+            phase -= 1.0
+
+        source = glottal(phase)
+        shaped = r1.process(source) + 0.5 * r2.process(source)
+
+        # Raise, hold, fall.
+        if t < attack:
+            env = 0.5 - 0.5 * math.cos(math.pi * t / attack)
+        elif t < attack + body:
+            env = 1.0
+        else:
+            rel = (t - attack - body) / release
+            env = 0.5 + 0.5 * math.cos(math.pi * min(1.0, rel))
+
+        out.append(shaped * env * 0.4)
+
+    return out
+
+
+def tone(freq: float, duration: float, harmonics: int = 3, decay: float = 6.0,
+         vibrato: float = 0.0) -> list[float]:
+    """A plain musical tone, for the sound effects."""
+    n = int(RATE * duration)
+    out = []
+    for i in range(n):
+        t = i / RATE
+        progress = i / max(1, n)
+        f = freq * (1.0 + vibrato * math.sin(2 * math.pi * 6.0 * t))
+        value = 0.0
+        for h in range(1, harmonics + 1):
+            value += math.sin(2 * math.pi * f * h * t) / (h * h)
+        env = min(1.0, t / 0.005) * math.exp(-decay * progress)
+        out.append(value * env * 0.32)
+    return out
+
+
+def sfx_file(name: str) -> str | None:
+    """A sound effect of your own, if you dropped one in the sfx folder."""
+    stem = name.strip().lower()
+    if not stem or "/" in stem or stem.startswith("."):
+        return None
+    for ext in (".wav", ".ogg", ".flac", ".mp3"):
+        path = os.path.join(SFX_DIR, stem + ext)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def play_file(path: str) -> None:
+    """Play a sound file with whatever player this machine has."""
+    for player in (["pw-play", path], ["paplay", path],
+                   ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                   ["aplay", "-q", path]):
+        if not shutil.which(player[0]):
+            continue
+        try:
+            subprocess.run(player, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        return
+
+
+def sfx(name: str) -> bytes:
+    """A short sound effect."""
+    if name == "click":
+        # A bright little boop: the sound of being tapped.
+        samples = tone(760, 0.09, harmonics=3, decay=9.0)
+        samples += tone(1180, 0.07, harmonics=2, decay=11.0)
+    elif name == "happy":
+        samples = (tone(660, 0.09, decay=8.0) + tone(880, 0.09, decay=8.0)
+                   + tone(1180, 0.16, decay=6.0))
+    elif name == "love":
+        samples = (tone(520, 0.13, decay=5.0, vibrato=0.02)
+                   + tone(784, 0.22, decay=4.0, vibrato=0.02))
+    elif name == "sad":
+        samples = (tone(520, 0.16, decay=5.0) + tone(392, 0.28, decay=4.0))
+    elif name == "surprised":
+        samples = tone(420, 0.13, harmonics=2, decay=3.0)
+        # a quick rise
+        rise = []
+        for i in range(int(RATE * 0.1)):
+            t = i / RATE
+            f = 600 + 900 * (i / (RATE * 0.1))
+            rise.append(math.sin(2 * math.pi * f * t) * 0.3
+                        * math.exp(-7.0 * i / (RATE * 0.1)))
+        samples += rise
+    elif name == "thinking":
+        samples = tone(340, 0.06, harmonics=2, decay=12.0)
+        samples += [0.0] * int(RATE * 0.06)
+        samples += tone(420, 0.08, harmonics=2, decay=10.0)
+    elif name == "sad_pop":
+        samples = tone(440, 0.12, harmonics=2, decay=7.0)
+    else:
+        samples = tone(700, 0.08, harmonics=2, decay=10.0)
+
+    return pack(samples)
+
+
+def pack(samples: list[float]) -> bytes:
+    return b"".join(struct.pack("<h", int(max(-1.0, min(1.0, s)) * 25000)) for s in samples)
+
+
+def sample_files() -> tuple[dict, list]:
+    """Map of letter -> wav file, plus a pool of anything else."""
+    named: dict[str, str] = {}
+    pool: list[str] = []
+    try:
+        entries = sorted(os.listdir(VOICE_DIR))
+    except OSError:
+        return named, pool
+    for name in entries:
+        if not name.lower().endswith(".wav"):
+            continue
+        path = os.path.join(VOICE_DIR, name)
+        stem = os.path.splitext(name)[0].lower()
+        if len(stem) == 1 and stem.isalpha():
+            named[stem] = path
+        else:
+            pool.append(path)
+    return named, pool
+
+
+def speak(text: str, rate: float = 11.0, pitch: float = 1.0,
+          voice: dict | None = None) -> bytes:
+    """Synthesise a line of text into raw s16le samples."""
+    rng = random.Random(hash(text) & 0xFFFF)
+    named, pool = sample_files()
+    voice = voice or VOICES["bright"]
+    formant_scale = voice.get("formant", 1.0)
+
+    samples: list[float] = []
+    syllables = [c for c in text if c.isalpha() or c.isdigit()]
+    if not syllables:
+        return b""
+
+    step = 0
+    for i, ch in enumerate(syllables):
+        if i % 4 == 0 and rng.random() < 0.35:
+            step += rng.choice([-2, -1, 1, 2])
+        else:
+            step += rng.choice([-1, 0, 0, 0, 1])
+        step = max(-4, min(7, step))
+
+        # A dropped sample wins over the synthesiser.
+        sample = named.get(ch.lower())
+        if sample is None and pool:
+            sample = rng.choice(pool)
+        if sample:
+            samples.extend(read_wav(sample))
+            samples.extend([0.0] * int(RATE * 0.012))
+            continue
+
+        octave = 12.0 * math.log2(max(0.5, pitch))
+        semis = PENTATONIC[step % len(PENTATONIC)] + 12 * (step // len(PENTATONIC))
+        f0 = voice.get("pitch", BASE_PITCH) * math.pow(2, (semis + octave) / 12.0)
+        f0 *= rng.uniform(0.95, 1.06)
+
+        if text.rstrip().endswith("?") and i > len(syllables) - 4:
+            f0 *= 1.0 + 0.08 * (i - (len(syllables) - 4))
+
+        duration = 1.0 / max(1.0, rate)
+        vowel = vowel_for(ch)
+        if formant_scale != 1.0:
+            vowel = (vowel[0] * formant_scale, vowel[1] * formant_scale,
+                     vowel[2], vowel[3])
+        samples.extend(blip(f0, duration * 0.82, vowel, i + (hash(ch) & 0xFFFF)))
+
+        gap = 0.011
+        if ch in ".,!?;:":
+            gap = 0.085
+        samples.extend([0.0] * int(RATE * gap))
+
+    fade = int(RATE * 0.012)
+    for i in range(min(fade, len(samples))):
+        samples[len(samples) - 1 - i] *= i / fade
+
+    return pack(samples)
+
+
+def read_wav(path: str) -> list[float]:
+    """Read a mono wav into normalised floats."""
+    try:
+        with wave.open(path, "rb") as w:
+            frames = w.readframes(w.getnframes())
+            channels = w.getnchannels()
+            width = w.getsampwidth()
+            if width != 2:
+                return []
+            count = len(frames) // 2
+            values = struct.unpack("<%dh" % count, frames[:count * 2])
+            out = [v / 32768.0 for v in values]
+            if channels > 1:
+                out = [sum(out[i:i + channels]) / channels
+                       for i in range(0, len(out) - channels + 1, channels)]
+            # Resample crudely to our rate so mixing is safe.
+            if w.getframerate() != RATE and out:
+                ratio = w.getframerate() / RATE
+                out = [out[min(len(out) - 1, int(j * ratio))]
+                       for j in range(int(len(out) / ratio))]
+            return out
+    except (OSError, wave.Error, struct.error):
+        return []
+
+
+class StreamPlayer:
+    """Plays raw samples into one long-lived PipeWire stream.
+
+    Spawning a player per syllable is what made the speech fall behind the
+    typing: each spawn costs tens of milliseconds. One stream, fed as the
+    syllables are produced, keeps them in step.
+    """
+
+    def __init__(self):
+        self.proc = None
+
+    def start(self) -> bool:
+        if not shutil.which("pw-cat"):
+            return False
+        try:
+            self.proc = subprocess.Popen(
+                ["pw-cat", "--playback", "--rate", str(RATE), "--channels", "1",
+                 "--format", "s16", "--latency", "40ms", "-"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            self.proc = None
+            return False
+        return True
+
+    def write(self, raw: bytes) -> bool:
+        if not self.proc or self.proc.poll() is not None:
+            return False
+        try:
+            self.proc.stdin.write(raw)
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def stop(self) -> None:
+        if not self.proc:
+            return
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self.proc = None
+
+
+def play(raw: bytes) -> None:
+    if not raw:
+        return
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+        path = fh.name
+    try:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(raw)
+        for player in (["paplay", path], ["pw-play", path], ["aplay", "-q", path]):
+            if not shutil.which(player[0]):
+                continue
+            try:
+                subprocess.run(player, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=60)
+                return
+            except (OSError, subprocess.SubprocessError):
+                continue
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def stream(rate: float, pitch: float, voice: dict) -> int:
+    """Speak every line that arrives on stdin, as it arrives."""
+    player = StreamPlayer()
+    if not player.start():
+        # No PipeWire stream available: fall back to a player per line.
+        for line in sys.stdin:
+            line = line.rstrip("\n")
+            if line:
+                play(speak(line, rate=rate, pitch=pitch, voice=voice))
+        return 0
+
+    try:
+        for line in sys.stdin:
+            line = line.rstrip("\n")
+            if line == "":
+                continue
+            raw = speak(line, rate=rate, pitch=pitch, voice=voice)
+            if not player.write(raw):
+                play(raw)
+    finally:
+        player.stop()
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    rate = 11.0
+    pitch = 1.0
+    do_stream = False
+    effect = ""
+    voice_name = "bright"
+    text_parts = []
+
+    while args:
+        arg = args.pop(0)
+        if arg == "--rate" and args:
+            rate = float(args.pop(0))
+        elif arg == "--pitch" and args:
+            pitch = float(args.pop(0))
+        elif arg == "--stream":
+            do_stream = True
+        elif arg == "--sfx" and args:
+            effect = args.pop(0)
+        elif arg == "--base" and args:
+            voice_name = args.pop(0).lower()
+        elif arg in ("--help", "-h"):
+            print(__doc__)
+            return 0
+        else:
+            text_parts.append(arg)
+
+    if effect:
+        sample = sfx_file(effect)
+        if sample:
+            play_file(sample)
+        else:
+            play(sfx(effect))
+        return 0
+
+    voice = VOICES.get(voice_name, VOICES["bright"])
+
+    if do_stream:
+        return stream(rate, pitch, voice)
+
+    text = " ".join(text_parts)
+    if not text.strip():
+        return 0
+    play(speak(text, rate=rate, pitch=pitch, voice=voice))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

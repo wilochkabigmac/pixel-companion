@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# oc-quick - send the current selection to the opencode companion, copy the answer back.
+#
+#   oc-quick                     # default task (see TASK_DEFAULT)
+#   oc-quick translate to russian
+#   oc-quick --task "fix the grammar"
+#
+# The selection is read from the PRIMARY buffer (what you highlighted), falling
+# back to the clipboard. The reply lands in the clipboard and in a notification.
+set -uo pipefail
+
+TASK_DEFAULT="Explain this clearly and concisely."
+TASK=""
+MODE="text"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --task) TASK="${2:-}"; shift 2 ;;
+    --text) MODE="text"; shift ;;
+    --help|-h)
+      sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) TASK="$TASK $1"; shift ;;
+  esac
+done
+
+TASK="$(echo "${TASK:-$TASK_DEFAULT}" | sed 's/^ *//;s/ *$//')"
+
+if ! command -v wl-paste >/dev/null; then
+  echo "wl-paste is required (wl-clipboard)" >&2
+  exit 1
+fi
+
+selection="$(wl-paste --primary --no-newline 2>/dev/null || true)"
+if [[ -z "${selection//[[:space:]]/}" ]]; then
+  selection="$(wl-paste --no-newline 2>/dev/null || true)"
+fi
+
+if [[ -z "${selection//[[:space:]]/}" ]]; then
+  echo "nothing selected" >&2
+  exit 1
+fi
+
+prompt="Task: ${TASK}
+
+Selected text:
+\"\"\"
+${selection}
+\"\"\"
+
+Answer directly - no preamble, no restating the task."
+
+reply="$(oc-ask --jsonl "$prompt" 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if event.get("type") == "reply":
+        print(event.get("text", ""))
+    elif event.get("type") == "error":
+        print("ERROR:" + event.get("message", ""), file=sys.stderr)
+')"
+
+if [[ -z "${reply//[[:space:]]/}" ]]; then
+  echo "no reply from the assistant" >&2
+  exit 1
+fi
+
+# wl-copy forks and keeps running to serve the clipboard. Without detaching it
+# from our stdout it holds the pipe open and the caller hangs forever.
+printf '%s' "$reply" | wl-copy >/dev/null 2>&1
+
+# Show the answer in the assistant bubble rather than a toast, so everything
+# the agent says ends up in the same place.
+if command -v oc-companion >/dev/null; then
+  oc-companion result "$reply" >/dev/null 2>&1 || true
+fi
+
+printf '%s\n' "$reply"

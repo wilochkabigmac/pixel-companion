@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""oc-steam - the user's Steam games.
+
+Reads the installed game manifests, so it knows what is on the machine.
+
+    oc-steam list              the installed games
+    oc-steam play <name>       start one
+    oc-steam playing           what is running, if Steam says
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOTS = [
+    os.path.expanduser("~/.local/share/Steam/steamapps"),
+    os.path.expanduser("~/.steam/steamapps"),
+    os.path.expanduser("~/.steam/root/steamapps"),
+]
+
+
+def appid_dir() -> str:
+    for root in ROOTS:
+        if os.path.isdir(root):
+            return root
+    return ROOTS[0]
+
+
+def games() -> list[dict]:
+    found = []
+    root = appid_dir()
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.startswith("appmanifest_") or not entry.endswith(".acf"):
+            continue
+        try:
+            with open(os.path.join(root, entry), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        data = {}
+        # Valve's text format: "key"  "value", with tabs in between.
+        for line in text.splitlines():
+            for match in re.finditer(r'"([^"]+)"\s*"([^"]*)"', line):
+                data[match.group(1)] = match.group(2)
+        name = data.get("name", "")
+        appid = data.get("appid", "")
+        if name and appid:
+            found.append({"name": name, "appid": appid,
+                          "installed": data.get("StateFlags", "") == "4"})
+    return sorted(found, key=lambda g: g["name"].lower())
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    action = args[0] if args else "list"
+
+    if action == "list":
+        for game in games():
+            print(f"{game['appid']}  {game['name']}")
+        return 0
+
+    if action == "play":
+        if len(args) < 2:
+            print("play what?", file=sys.stderr)
+            return 2
+        needle = " ".join(args[1:]).lower()
+        matches = [g for g in games() if needle in g["name"].lower()]
+        if not matches:
+            print(f"no game called {needle!r}", file=sys.stderr)
+            return 1
+        best = matches[0]
+        print(f"starting {best['name']}")
+        subprocess.run(["steam", f"steam://rungameid/{best['appid']}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+
+    if action == "playing":
+        try:
+            res = subprocess.run(["steam", "-applaunch", "--"], capture_output=True,
+                                 text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            res = None
+        print(res.stdout.strip() if res else "steam is not running")
+        return 0
+
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

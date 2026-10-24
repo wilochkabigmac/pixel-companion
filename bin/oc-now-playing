@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""oc-now-playing - what is playing right now.
+
+Talks to the MPRIS interface that Spotify, VLC, Firefox and the rest
+register with, so it works with whatever is playing, not just one player.
+
+    oc-now-playing            a line per player
+    oc-now-playing --json     the same as JSON
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+
+BUS = "org.mpris.MediaPlayer2"
+PATH = "/org/mpris/MediaPlayer2"
+IFACE = "org.mpris.MediaPlayer2.Player"
+
+
+def gdbus(*args) -> str:
+    try:
+        res = subprocess.run(["gdbus", "call", "--session", *args],
+                             capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def players() -> list[str]:
+    out = gdbus("--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus",
+                "--method", "org.freedesktop.DBus.ListNames")
+    names = re.findall(r"'(org\.mpris\.MediaPlayer2\.[^']+)'", out)
+    return [n for n in names if not n.endswith(".instance")]
+
+
+def unwrap(text: str) -> str:
+    """gdbus prints values wrapped in angle brackets: (<'Paused'>,)."""
+    match = re.search(r"<(.*)>", text, re.S)
+    return match.group(1) if match else ""
+
+
+def property(player: str, name: str) -> str:
+    out = gdbus("--dest", player, "--object-path", PATH,
+                "--method", "org.freedesktop.DBus.Properties.Get", IFACE, name)
+    return unwrap(out).strip("'\"")
+
+
+def describe(player: str) -> dict:
+    meta = property(player, "Metadata")
+    status = property(player, "PlaybackStatus")
+
+    def field(key: str) -> str:
+        index = meta.find("'" + key + "':")
+        if index < 0:
+            return ""
+        rest = meta[index + len(key) + 3:]
+        match = re.search(r"<([^<>]*)>", rest)
+        if not match:
+            return ""
+        value = match.group(1).strip()
+        if value.startswith("['") and value.endswith("']"):
+            value = value[2:-2]
+        value = value.strip("'")
+        return value
+
+    artist = field("xesam:artist")
+    title = field("xesam:title")
+    album = field("xesam:album")
+    length = field("mpris:length")
+    return {
+        "player": player.split(".")[-1],
+        "status": status,
+        "artist": artist,
+        "title": title,
+        "album": album,
+        "length": length,
+    }
+
+
+def main(argv: list[str]) -> int:
+    found = [describe(p) for p in players()]
+    if "--json" in argv:
+        print(json.dumps(found, indent=2))
+        return 0
+
+    if not found:
+        print("nothing is playing")
+        return 0
+
+    for item in found:
+        if item["status"] == "Playing" or item["title"]:
+            who = " - ".join(x for x in (item["artist"], item["title"]) if x)
+            print(f"{item['player']}: {item['status']} | {who or 'unknown'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

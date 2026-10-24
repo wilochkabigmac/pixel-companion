@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""oc-ask - talk to the local opencode server from scripts and the desktop companion.
+
+Talks to the same opencode server the TUI and web UI use, so every client
+shares one history.
+
+Usage:
+  oc-ask "text"              send a message, print the reply
+  oc-ask --jsonl "text"      send a message, stream JSONL events on stdout
+  oc-ask --session           print the current session id
+  oc-ask --reset             start a new session
+  oc-ask --permissions       list pending permission requests as JSON
+  oc-ask --reply ID DECISION reply to a permission request (once|always|reject)
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local", "state", "oc-companion")
+STATE_FILE = os.path.join(STATE_DIR, "session.json")
+SERVER_FILE = os.path.join(STATE_DIR, "server.json")
+WORKSPACE = os.path.join(STATE_DIR, "workspace")
+CONFIG_FILE = os.path.join(HOME, ".config", "oc-companion", "config.json")
+SERVICE_FILE = os.path.join(HOME, ".config", "opencode", "service.json")
+COMPANION_DIR = os.path.join(HOME, ".config", "quickshell", "companion")
+
+BUILTIN_MOODS = {"idle", "talking", "happy", "love", "sad", "surprised", "thinking"}
+
+DEFAULTS = {
+    "agent": "Build",
+    # A dedicated scratch directory. Keeping the companion out of your normal
+    # working directories means a TUI you start elsewhere will not attach to
+    # its session and interleave messages with it.
+    "directory": WORKSPACE,
+    "model": None,
+    "timeout": 300,
+    "poll_interval": 1.0,
+    # "shared"   - use the opencode server you already run (default)
+    # "dedicated"- use our own server instance, fully isolated from a TUI
+    "server": "shared",
+}
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            cfg.update(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# server plumbing
+# --------------------------------------------------------------------------
+
+def _run(cmd: list[str], timeout: int = 30) -> str:
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (res.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def service_url() -> str:
+    """Return the base URL of the opencode server to talk to.
+
+    With "dedicated" mode we talk to our own server instance, which no TUI
+    can attach to. Otherwise we use the background service you already run.
+    """
+    dedicated = _dedicated_server()
+    if dedicated:
+        return dedicated["url"]
+
+    for attempt in range(4):
+        out = _run(["opencode", "service", "status"])
+        match = re.search(r"https?://[^\s]+", out)
+        if match:
+            return match.group(0).rstrip(",;")
+
+        if attempt == 0:
+            log("opencode service is not running, starting it...")
+            _run(["opencode", "service", "start"], timeout=60)
+        time.sleep(1.0 + attempt)
+
+    raise RuntimeError("could not reach the opencode server (is `opencode service start` working?)")
+
+
+_dedicated_cache: dict | None = None
+_dedicated_checked = False
+
+
+def _dedicated_server() -> dict | None:
+    """Return our own server's details, if one is running."""
+    global _dedicated_cache, _dedicated_checked
+    if _dedicated_checked:
+        return _dedicated_cache
+
+    _dedicated_checked = True
+    _dedicated_cache = None
+    if load_config().get("server", "shared") != "dedicated":
+        return None
+
+    try:
+        with open(SERVER_FILE, encoding="utf-8") as fh:
+            info = json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+    url = info.get("url")
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(f"{url}/global/health")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status != 200:
+                return None
+    except Exception:
+        return None
+
+    _dedicated_cache = info
+    return info
+
+
+def password() -> str:
+    dedicated = _dedicated_server()
+    if dedicated:
+        return dedicated.get("password") or ""
+
+    try:
+        with open(SERVICE_FILE, encoding="utf-8") as fh:
+            pw = json.load(fh).get("password")
+            if pw:
+                return pw
+    except (OSError, ValueError):
+        pass
+    return os.environ.get("OPENCODE_SERVER_PASSWORD", "")
+
+
+def api(method: str, path: str, body=None, timeout: int = 60, base: str | None = None):
+    """Call the opencode v2 API with basic auth."""
+    base = base or service_url()
+    url = f"{base}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    pw = password()
+    if pw:
+        token = base64.b64encode(f"opencode:{pw}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:300]
+        raise RuntimeError(f"opencode API {method} {path} -> HTTP {exc.code}: {detail}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"opencode API {method} {path} -> {exc.reason}") from None
+
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# session handling
+# --------------------------------------------------------------------------
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+def resolve_agent(name: str) -> str:
+    """Map a display name ('Build') to the agent id the API expects ('build')."""
+    if not name:
+        return ""
+    try:
+        res = api("GET", "/api/agent", timeout=20)
+    except RuntimeError:
+        return name
+    for agent in (res or {}).get("data") or []:
+        if agent.get("id") == name:
+            return name
+        if (agent.get("name") or "").lower() == name.lower():
+            return agent.get("id") or name
+    return name
+
+
+def create_session(cfg: dict) -> str:
+    directory = cfg["directory"]
+    if directory == WORKSPACE:
+        os.makedirs(WORKSPACE, exist_ok=True)
+
+    payload = {
+        "title": "Companion",
+        "location": {"directory": directory},
+    }
+    if cfg.get("agent"):
+        payload["agent"] = resolve_agent(cfg["agent"])
+    if cfg.get("model"):
+        # Parse model string: "provider/model" or "provider/subpath/model"
+        model = cfg["model"]
+        provider, _, rest = model.partition("/")
+        if rest:
+            payload["model"] = {"providerID": provider, "id": rest}
+        else:
+            # Just a model name without provider - let OpenCode handle it
+            payload["model"] = model
+
+    res = api("POST", "/api/session", payload)
+    data = (res or {}).get("data") or {}
+    sid = data.get("id")
+    if not sid:
+        raise RuntimeError("opencode did not return a session id")
+    save_state({"id": sid, "directory": cfg["directory"], "created": int(time.time())})
+    return sid
+
+def ensure_session(cfg: dict) -> str:
+    state = load_state()
+    sid = state.get("id")
+    if sid:
+        if state.get("directory") != cfg["directory"]:
+            return create_session(cfg)
+        try:
+            api("GET", f"/api/session/{sid}", timeout=20)
+            return sid
+        except RuntimeError:
+            pass
+    return create_session(cfg)
+
+
+# --------------------------------------------------------------------------
+# messaging
+# --------------------------------------------------------------------------
+
+def session_error(sid: str) -> str:
+    """Return the error message from the most recent failed turn, if any."""
+    for msg in fetch_messages(sid):
+        if msg.get("type") != "idle" or msg.get("outcome") != "failed":
+            continue
+        err = msg.get("error") or {}
+        return err.get("message") or "the agent failed"
+    return ""
+
+
+def pending_permissions(sid: str) -> list:
+    try:
+        res = api("GET", f"/api/session/{sid}/permission", timeout=20)
+    except RuntimeError:
+        return []
+    return (res or {}).get("data") or []
+
+
+def fetch_messages(sid: str) -> list:
+    try:
+        res = api("GET", f"/api/session/{sid}/message?limit=60", timeout=30)
+    except RuntimeError:
+        return []
+    return (res or {}).get("data") or []
+
+
+def _assistant_text(msg: dict) -> str:
+    chunks = []
+    for part in msg.get("content") or []:
+        if part.get("type") == "text" and part.get("text"):
+            chunks.append(part["text"])
+    return "\n".join(chunks).strip()
+
+
+def turn_after(sid: str, user_msg_id: str) -> tuple[str, bool, str]:
+    """Find the reply that belongs to the prompt we sent.
+
+    Returns (text, finished, error). Messages are returned newest first, so
+    everything above our own user message belongs to later turns. The turn is
+    over once its 'idle' message shows up, which keeps us from grabbing a
+    half-written message or a reply that was meant for somebody else.
+    """
+    messages = fetch_messages(sid)
+
+    index = None
+    for i, msg in enumerate(messages):
+        if msg.get("id") == user_msg_id:
+            index = i
+            break
+    if index is None:
+        return "", False, ""
+
+    # Our turn: the messages after ours, up to the next user message (which
+    # would be somebody else typing into the same session).
+    region = []
+    for msg in messages[:index]:
+        if msg.get("type") == "user":
+            break
+        region.append(msg)
+
+    idle = next((m for m in region if m.get("type") == "idle"), None)
+    if idle is None:
+        return "", False, ""
+
+    if idle.get("outcome") == "failed":
+        err = idle.get("error") or {}
+        return "", True, err.get("message") or "the agent failed"
+
+    for msg in region:
+        if msg.get("type") == "assistant":
+            text = _assistant_text(msg)
+            if text:
+                return text, True, ""
+
+    return "", True, ""
+
+
+def wait_idle(sid: str, deadline: float, max_wait: float = 20.0) -> bool:
+    """Wait until no turn is in flight.
+
+    Another client (a TUI, the web UI) may be mid-turn in the same session.
+    If we prompt while that is happening, the running turn's reply lands
+    after our message and we cannot tell whose answer we got. So we let the
+    session go quiet first - but not forever, or a busy session would block
+    us indefinitely.
+    """
+    give_up = min(deadline, time.time() + max_wait)
+    while time.time() < give_up:
+        if pending_permissions(sid):
+            return True  # a turn is blocked on a decision, not on the model
+        messages = fetch_messages(sid)
+        if not messages:
+            return True
+        newest = messages[0]
+        if newest.get("type") == "idle":
+            return True
+        # Safety net: a completed assistant message that has not been followed
+        # by an idle marker is not worth waiting on forever.
+        created = ((newest.get("time") or {}).get("created") or 0) / 1000.0
+        if created and (time.time() - created) > 15:
+            return True
+        time.sleep(float(DEFAULTS["poll_interval"]))
+    return False
+
+
+def use_vision_model(sid: str, cfg: dict) -> dict | None:
+    """Point the session at a model that can see.
+
+    Not every model takes images, so a picture switches the session to the
+    vision one for the turn. The model it had before is returned, so it can
+    be put back afterwards.
+    """
+    model = cfg.get("visionModel")
+    if not model:
+        return None
+    provider, _, name = model.partition("/")
+    if not name:
+        return None
+
+    previous = None
+    try:
+        info = api("GET", f"/api/session/{sid}", timeout=20) or {}
+        current = (info.get("data") or {}).get("model")
+        if current and current.get("id") and current.get("providerID"):
+            previous = {"providerID": current["providerID"], "id": current["id"]}
+    except RuntimeError:
+        pass
+
+    try:
+        api("POST", f"/api/session/{sid}/model",
+            {"model": {"providerID": provider, "id": name}}, timeout=20)
+    except RuntimeError:
+        pass
+    return previous
+
+
+def restore_model(sid: str, model: dict | None) -> None:
+    if not model:
+        return
+    try:
+        api("POST", f"/api/session/{sid}/model", {"model": model}, timeout=20)
+    except RuntimeError:
+        pass
+
+
+def custom_moods() -> list[str]:
+    """Expression names that have artwork: character-angry.png -> angry."""
+    try:
+        entries = sorted(os.listdir(COMPANION_DIR))
+    except OSError:
+        return []
+    found: list[str] = []
+    for name in entries:
+        stem, dot, ext = name.rpartition(".")
+        if not dot or not ext or not stem.startswith("character-"):
+            continue
+        mood = stem[len("character-"):].strip().lower()
+        if mood and mood not in BUILTIN_MOODS and mood not in found:
+            found.append(mood)
+    return found
+
+
+def apply_persona(sid: str, cfg: dict) -> None:
+    """Give the session its persona, so she knows who she is."""
+    persona = (cfg.get("persona") or "").strip()
+    if not persona:
+        return
+    extra = custom_moods()
+    if extra:
+        tags = ", ".join(f"[mood:{mood}]" for mood in extra)
+        persona += ("\n\nBesides the moods above you also have artwork for "
+                    f"these expressions: {tags}. They work exactly the same "
+                    "way; use them when they fit better.")
+    try:
+        api("PUT", f"/api/experimental/session/{sid}/instructions/entries/companion",
+            {"value": persona}, timeout=20)
+    except RuntimeError:
+        pass  # a missing persona is not worth failing over
+
+
+def ask(text: str, cfg: dict, emit=None, files=None) -> str:
+    """Send a message and wait for the reply, streaming events via emit()."""
+    emit = emit or (lambda kind, payload: None)
+    sid = ensure_session(cfg)
+    emit("session", {"id": sid})
+    apply_persona(sid, cfg)
+    previous_model = None
+    if files:
+        previous_model = use_vision_model(sid, cfg)
+
+    deadline = time.time() + float(cfg.get("timeout", 300))
+    seen_permissions = set()
+    last_error = ""
+
+    # A prompt can be pre-empted when another client types into the same
+    # session (opencode "steers" the running turn). Retry once in that case.
+    for attempt in range(2):
+        wait_idle(sid, deadline)
+
+        payload = {"text": text}
+        if files:
+            payload["files"] = [{"uri": "file://" + os.path.abspath(f),
+                                 "name": os.path.basename(f)} for f in files]
+        res = api("POST", f"/api/session/{sid}/prompt", payload, timeout=60)
+        user_msg_id = ((res or {}).get("data") or {}).get("id") or ""
+        emit("status", {"state": "thinking"})
+
+        while time.time() < deadline:
+            for req in pending_permissions(sid):
+                rid = req.get("id")
+                if rid and rid not in seen_permissions:
+                    seen_permissions.add(rid)
+                    emit("permission", req)
+
+            reply, finished, error = turn_after(sid, user_msg_id)
+            if finished:
+                if error:
+                    raise RuntimeError(error)
+                if reply:
+                    emit("reply", {"text": reply})
+                    return reply
+                last_error = "the agent did not return any text"
+                break
+            time.sleep(float(cfg.get("poll_interval", 1.0)))
+        else:
+            raise RuntimeError("timed out waiting for a reply from opencode")
+
+        if attempt == 0:
+            time.sleep(1.0)
+
+    raise RuntimeError(last_error or "the agent did not return any text")
+
+
+def reply_permission(request_id: str, decision: str) -> None:
+    api("POST", f"/api/session/{load_state().get('id')}/permission/{request_id}/reply",
+        {"decision": decision})
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    cfg = load_config()
+    args = argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+
+    if "--session" in args:
+        print(load_state().get("id", ""))
+        return 0
+
+    if "--reset" in args:
+        create_session(cfg)
+        print(load_state().get("id", ""))
+        return 0
+
+    if "--permissions" in args:
+        print(json.dumps(pending_permissions(load_state().get("id", "")), indent=2))
+        return 0
+
+    if "--reply" in args:
+        idx = args.index("--reply")
+        try:
+            request_id = args[idx + 1]
+            decision = args[idx + 2]
+        except IndexError:
+            log("usage: oc-ask --reply <id> <once|always|reject>")
+            return 2
+        reply_permission(request_id, decision)
+        return 0
+
+    jsonl = "--jsonl" in args
+    if jsonl:
+        args.remove("--jsonl")
+
+    files = []
+    while "--attach" in args:
+        i = args.index("--attach")
+        if i + 1 >= len(args):
+            break
+        files.append(args[i + 1])
+        del args[i:i + 2]
+
+    text = " ".join(args).strip()
+    if not text and not files:
+        log("nothing to say")
+        return 2
+
+    def emit(kind: str, payload: dict) -> None:
+        if not jsonl:
+            return
+        print(json.dumps({"type": kind, **payload}), flush=True)
+
+    try:
+        result = ask(text, cfg, emit, files)
+    except RuntimeError as exc:
+        if jsonl:
+            print(json.dumps({"type": "error", "message": str(exc)}), flush=True)
+        else:
+            log(str(exc))
+        return 1
+
+    if not jsonl:
+        print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

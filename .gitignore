@@ -1,0 +1,26 @@
+# User config and state
+config.json
+
+# Generated/runtime files
+*.pyc
+__pycache__/
+.DS_Store
+*.log
+*.pid
+
+# User customizations
+character*.png
+character*.gif
+character*.webp
+voice/*.wav
+sfx/*.wav
+sfx/*.ogg
+sfx/*.mp3
+sfx/*.flac
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
