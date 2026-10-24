@@ -49,6 +49,7 @@ Edit `~/.config/oc-companion/config.json`:
 ```json
 {
   "persona": "YOUR_PERSONA_HERE",
+  "model": "YOUR_AI_MODEL_HERE",
   "agent": "Build",
   "server": "shared",
   "voice": true,
@@ -58,10 +59,16 @@ Edit `~/.config/oc-companion/config.json`:
 }
 ```
 
-**Replace `YOUR_PERSONA_HERE`** with who you want her to be. Example:
+**1. Replace `YOUR_PERSONA_HERE`** with who you want her to be. Example:
 
 ```json
 "persona": "You are Pixel, a helpful desktop assistant. Keep replies short and friendly."
+```
+
+**2. Replace `YOUR_AI_MODEL_HERE`** with whatever opencode model you have. Example:
+
+```json
+"model": "openroute/kr/claude-sonnet-4.5"
 ```
 
 The full default persona is in `config.example.json` — copy what you want.
